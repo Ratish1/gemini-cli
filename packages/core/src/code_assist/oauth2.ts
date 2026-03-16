@@ -4,12 +4,14 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import type { Credentials, AuthClient, JWTInput } from 'google-auth-library';
 import {
   OAuth2Client,
   Compute,
   CodeChallengeMethod,
   GoogleAuth,
+  type Credentials,
+  type AuthClient,
+  type JWTInput,
 } from 'google-auth-library';
 import * as http from 'node:http';
 import url from 'node:url';
@@ -45,6 +47,7 @@ import {
   exitAlternateScreen,
 } from '../utils/terminal.js';
 import { coreEvents, CoreEvent } from '../utils/events.js';
+import { getConsentForOauth } from '../utils/authConsent.js';
 
 export const authEvents = new EventEmitter();
 
@@ -123,8 +126,9 @@ async function initOauthClient(
 
   if (
     credentials &&
-    (credentials as { type?: string }).type ===
-      'external_account_authorized_user'
+    typeof credentials === 'object' &&
+    'type' in credentials &&
+    credentials.type === 'external_account_authorized_user'
   ) {
     const auth = new GoogleAuth({
       scopes: OAUTH_SCOPE,
@@ -229,6 +233,13 @@ async function initOauthClient(
   }
 
   if (config.isBrowserLaunchSuppressed()) {
+    if (!config.isInteractive()) {
+      throw new FatalAuthenticationError(
+        'Manual authorization is required but the current session is non-interactive. ' +
+          'Please run the Gemini CLI in an interactive terminal to log in, ' +
+          'provide a GEMINI_API_KEY, or ensure Application Default Credentials are configured.',
+      );
+    }
     let success = false;
     const maxRetries = 2;
     // Enter alternate buffer
@@ -276,13 +287,20 @@ async function initOauthClient(
 
     await triggerPostAuthCallbacks(client.credentials);
   } else {
+    // In ACP mode, we skip the interactive consent and directly open the browser
+    if (!config.getAcpMode()) {
+      const userConsent = await getConsentForOauth('');
+      if (!userConsent) {
+        throw new FatalCancellationError('Authentication cancelled by user.');
+      }
+    }
+
     const webLogin = await authWithWeb(client);
 
     coreEvents.emit(CoreEvent.UserFeedback, {
       severity: 'info',
       message:
-        `\n\nCode Assist login required.\n` +
-        `Attempting to open authentication page in your browser.\n` +
+        `\n\nAttempting to open authentication page in your browser.\n` +
         `Otherwise navigate to:\n\n${webLogin.authUrl}\n\n\n`,
     });
     try {
@@ -408,14 +426,24 @@ async function authWithUserCode(client: OAuth2Client): Promise<boolean> {
         '\n\n',
     );
 
-    const code = await new Promise<string>((resolve, _) => {
+    const code = await new Promise<string>((resolve, reject) => {
       const rl = readline.createInterface({
         input: process.stdin,
         output: createWorkingStdio().stdout,
         terminal: true,
       });
 
+      const timeout = setTimeout(() => {
+        rl.close();
+        reject(
+          new FatalAuthenticationError(
+            'Authorization timed out after 5 minutes.',
+          ),
+        );
+      }, 300000); // 5 minute timeout
+
       rl.question('Enter the authorization code: ', (code) => {
+        clearTimeout(timeout);
         rl.close();
         resolve(code.trim());
       });
@@ -492,6 +520,7 @@ async function authWithWeb(client: OAuth2Client): Promise<OauthWebLogin> {
               'OAuth callback not received. Unexpected request: ' + req.url,
             ),
           );
+          return;
         }
         // acquire the code from the querystring, and close the web server.
         const qs = new url.URL(req.url!, 'http://127.0.0.1:3000').searchParams;
@@ -605,8 +634,10 @@ export function getAvailablePort(): Promise<number> {
       }
       const server = net.createServer();
       server.listen(0, () => {
-        const address = server.address()! as net.AddressInfo;
-        port = address.port;
+        const address = server.address();
+        if (address && typeof address === 'object') {
+          port = address.port;
+        }
       });
       server.on('listening', () => {
         server.close();
@@ -636,6 +667,7 @@ async function fetchCachedCredentials(): Promise<
   for (const keyFile of pathsToTry) {
     try {
       const keyFileString = await fs.readFile(keyFile, 'utf-8');
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-return
       return JSON.parse(keyFileString);
     } catch (error) {
       // Log specific error for debugging, but continue trying other paths
@@ -696,8 +728,14 @@ async function fetchAndCacheUserInfo(client: OAuth2Client): Promise<void> {
       return;
     }
 
-    const userInfo = (await response.json()) as { email?: unknown };
-    if (userInfo && typeof userInfo.email === 'string' && userInfo.email) {
+    const userInfo = (await response.json()) as unknown;
+    if (
+      userInfo &&
+      typeof userInfo === 'object' &&
+      'email' in userInfo &&
+      typeof userInfo.email === 'string' &&
+      userInfo.email
+    ) {
       await userAccountManager.cacheGoogleAccount(userInfo.email);
       debugLogger.log('Cached Google Account:', userInfo.email);
     } else {

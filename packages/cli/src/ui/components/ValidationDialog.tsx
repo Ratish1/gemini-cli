@@ -16,7 +16,8 @@ import {
   type ValidationIntent,
 } from '@google/gemini-cli-core';
 import { useKeypress } from '../hooks/useKeypress.js';
-import { keyMatchers, Command } from '../keyMatchers.js';
+import { Command } from '../key/keyMatchers.js';
+import { useKeyMatchers } from '../hooks/useKeyMatchers.js';
 
 interface ValidationDialogProps {
   validationLink?: string;
@@ -32,6 +33,7 @@ export function ValidationDialog({
   learnMoreUrl,
   onChoice,
 }: ValidationDialogProps): React.JSX.Element {
+  const keyMatchers = useKeyMatchers();
   const [state, setState] = useState<DialogState>('choosing');
   const [errorMessage, setErrorMessage] = useState<string>('');
 
@@ -48,17 +50,20 @@ export function ValidationDialog({
     },
   ];
 
-  // Handle keypresses during 'waiting' state (ESC to cancel, Enter to confirm completion)
+  // Handle keypresses globally for cancellation, and specific logic for waiting state
   useKeypress(
     (key) => {
       if (keyMatchers[Command.ESCAPE](key) || keyMatchers[Command.QUIT](key)) {
         onChoice('cancel');
-      } else if (keyMatchers[Command.RETURN](key)) {
+        return true;
+      } else if (state === 'waiting' && keyMatchers[Command.RETURN](key)) {
         // User confirmed verification is complete - transition to 'complete' state
         setState('complete');
+        return true;
       }
+      return false;
     },
-    { isActive: state === 'waiting' },
+    { isActive: state !== 'complete' },
   );
 
   // When state becomes 'complete', show success message briefly then proceed
@@ -131,7 +136,7 @@ export function ValidationDialog({
           <CliSpinner />
           <Text>
             {' '}
-            Waiting for verification... (Press ESC or CTRL+C to cancel)
+            Waiting for verification... (Press Esc or Ctrl+C to cancel)
           </Text>
         </Box>
         {errorMessage && (

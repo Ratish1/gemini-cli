@@ -28,6 +28,8 @@ Create a directory for hooks and a simple logging script.
 > This example uses `jq` to parse JSON. If you don't have it installed, you can
 > perform similar logic using Node.js or Python.
 
+**macOS/Linux**
+
 ```bash
 mkdir -p .gemini/hooks
 cat > .gemini/hooks/log-tools.sh << 'EOF'
@@ -50,6 +52,28 @@ exit 0
 EOF
 
 chmod +x .gemini/hooks/log-tools.sh
+```
+
+**Windows (PowerShell)**
+
+```powershell
+New-Item -ItemType Directory -Force -Path ".gemini\hooks"
+@"
+# Read hook input from stdin
+`$inputJson = `$input | Out-String | ConvertFrom-Json
+
+# Extract tool name
+`$toolName = `$inputJson.tool_name
+
+# Log to stderr (visible in terminal if hook fails, or captured in logs)
+[Console]::Error.WriteLine("Logging tool: `$toolName")
+
+# Log to file
+"[`$(Get-Date -Format 'o')] Tool executed: `$toolName" | Out-File -FilePath ".gemini\tool-log.txt" -Append -Encoding utf8
+
+# Return success with empty JSON
+"{}"
+"@ | Out-File -FilePath ".gemini\hooks\log-tools.ps1" -Encoding utf8
 ```
 
 ## Exit Code Strategies
@@ -194,6 +218,7 @@ main().catch((err) => {
         "hooks": [
           {
             "name": "intent-filter",
+            "type": "command",
             "command": "node .gemini/hooks/filter-tools.js"
           }
         ]
@@ -234,7 +259,13 @@ security.
     "SessionStart": [
       {
         "matcher": "startup",
-        "hooks": [{ "name": "init", "command": "node .gemini/hooks/init.js" }]
+        "hooks": [
+          {
+            "name": "init",
+            "type": "command",
+            "command": "node .gemini/hooks/init.js"
+          }
+        ]
       }
     ],
     "BeforeAgent": [
@@ -243,6 +274,7 @@ security.
         "hooks": [
           {
             "name": "memory",
+            "type": "command",
             "command": "node .gemini/hooks/inject-memories.js"
           }
         ]
@@ -252,7 +284,11 @@ security.
       {
         "matcher": "*",
         "hooks": [
-          { "name": "filter", "command": "node .gemini/hooks/rag-filter.js" }
+          {
+            "name": "filter",
+            "type": "command",
+            "command": "node .gemini/hooks/rag-filter.js"
+          }
         ]
       }
     ],
@@ -260,7 +296,11 @@ security.
       {
         "matcher": "write_file",
         "hooks": [
-          { "name": "security", "command": "node .gemini/hooks/security.js" }
+          {
+            "name": "security",
+            "type": "command",
+            "command": "node .gemini/hooks/security.js"
+          }
         ]
       }
     ],
@@ -268,7 +308,11 @@ security.
       {
         "matcher": "*",
         "hooks": [
-          { "name": "record", "command": "node .gemini/hooks/record.js" }
+          {
+            "name": "record",
+            "type": "command",
+            "command": "node .gemini/hooks/record.js"
+          }
         ]
       }
     ],
@@ -276,7 +320,11 @@ security.
       {
         "matcher": "*",
         "hooks": [
-          { "name": "validate", "command": "node .gemini/hooks/validate.js" }
+          {
+            "name": "validate",
+            "type": "command",
+            "command": "node .gemini/hooks/validate.js"
+          }
         ]
       }
     ],
@@ -284,7 +332,11 @@ security.
       {
         "matcher": "exit",
         "hooks": [
-          { "name": "save", "command": "node .gemini/hooks/consolidate.js" }
+          {
+            "name": "save",
+            "type": "command",
+            "command": "node .gemini/hooks/consolidate.js"
+          }
         ]
       }
     ]

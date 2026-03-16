@@ -4,156 +4,18 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import type { MessageBus } from '../confirmation-bus/message-bus.js';
-import {
-  MessageBusType,
-  type HookExecutionRequest,
-  type HookExecutionResponse,
-} from '../confirmation-bus/types.js';
-import {
-  NotificationType,
-  type McpToolContext,
-  BeforeToolHookOutput,
-} from '../hooks/types.js';
+import { type McpToolContext, BeforeToolHookOutput } from '../hooks/types.js';
 import type { Config } from '../config/config.js';
 import type {
-  ToolCallConfirmationDetails,
   ToolResult,
   AnyDeclarativeTool,
+  AnyToolInvocation,
+  ToolLiveOutput,
 } from '../tools/tools.js';
 import { ToolErrorType } from '../tools/tool-error.js';
 import { debugLogger } from '../utils/debugLogger.js';
-import type { AnsiOutput, ShellExecutionConfig } from '../index.js';
-import type { AnyToolInvocation } from '../tools/tools.js';
-import { ShellToolInvocation } from '../tools/shell.js';
+import type { ShellExecutionConfig } from '../index.js';
 import { DiscoveredMCPToolInvocation } from '../tools/mcp-tool.js';
-
-/**
- * Serializable representation of tool confirmation details for hooks.
- * Excludes function properties like onConfirm that can't be serialized.
- */
-interface SerializableConfirmationDetails {
-  type: 'edit' | 'exec' | 'mcp' | 'info';
-  title: string;
-  // Edit-specific fields
-  fileName?: string;
-  filePath?: string;
-  fileDiff?: string;
-  originalContent?: string | null;
-  newContent?: string;
-  isModifying?: boolean;
-  // Exec-specific fields
-  command?: string;
-  rootCommand?: string;
-  // MCP-specific fields
-  serverName?: string;
-  toolName?: string;
-  toolDisplayName?: string;
-  // Info-specific fields
-  prompt?: string;
-  urls?: string[];
-}
-
-/**
- * Converts ToolCallConfirmationDetails to a serializable format for hooks.
- * Excludes function properties (onConfirm, ideConfirmation) that can't be serialized.
- */
-function toSerializableDetails(
-  details: ToolCallConfirmationDetails,
-): SerializableConfirmationDetails {
-  const base: SerializableConfirmationDetails = {
-    type: details.type,
-    title: details.title,
-  };
-
-  switch (details.type) {
-    case 'edit':
-      return {
-        ...base,
-        fileName: details.fileName,
-        filePath: details.filePath,
-        fileDiff: details.fileDiff,
-        originalContent: details.originalContent,
-        newContent: details.newContent,
-        isModifying: details.isModifying,
-      };
-    case 'exec':
-      return {
-        ...base,
-        command: details.command,
-        rootCommand: details.rootCommand,
-      };
-    case 'mcp':
-      return {
-        ...base,
-        serverName: details.serverName,
-        toolName: details.toolName,
-        toolDisplayName: details.toolDisplayName,
-      };
-    case 'info':
-      return {
-        ...base,
-        prompt: details.prompt,
-        urls: details.urls,
-      };
-    default:
-      return base;
-  }
-}
-
-/**
- * Gets the message to display in the notification hook for tool confirmation.
- */
-function getNotificationMessage(
-  confirmationDetails: ToolCallConfirmationDetails,
-): string {
-  switch (confirmationDetails.type) {
-    case 'edit':
-      return `Tool ${confirmationDetails.title} requires editing`;
-    case 'exec':
-      return `Tool ${confirmationDetails.title} requires execution`;
-    case 'mcp':
-      return `Tool ${confirmationDetails.title} requires MCP`;
-    case 'info':
-      return `Tool ${confirmationDetails.title} requires information`;
-    default:
-      return `Tool requires confirmation`;
-  }
-}
-
-/**
- * Fires the ToolPermission notification hook for a tool that needs confirmation.
- *
- * @param messageBus The message bus to use for hook communication
- * @param confirmationDetails The tool confirmation details
- */
-export async function fireToolNotificationHook(
-  messageBus: MessageBus,
-  confirmationDetails: ToolCallConfirmationDetails,
-): Promise<void> {
-  try {
-    const message = getNotificationMessage(confirmationDetails);
-    const serializedDetails = toSerializableDetails(confirmationDetails);
-
-    await messageBus.request<HookExecutionRequest, HookExecutionResponse>(
-      {
-        type: MessageBusType.HOOK_EXECUTION_REQUEST,
-        eventName: 'Notification',
-        input: {
-          notification_type: NotificationType.ToolPermission,
-          message,
-          details: serializedDetails,
-        },
-      },
-      MessageBusType.HOOK_EXECUTION_RESPONSE,
-    );
-  } catch (error) {
-    debugLogger.debug(
-      `Notification hook failed for ${confirmationDetails.title}:`,
-      error,
-    );
-  }
-}
 
 /**
  * Extracts MCP context from a tool invocation if it's an MCP tool.
@@ -163,7 +25,7 @@ export async function fireToolNotificationHook(
  * @returns MCP context if this is an MCP tool, undefined otherwise
  */
 function extractMcpContext(
-  invocation: ShellToolInvocation | AnyToolInvocation,
+  invocation: AnyToolInvocation,
   config: Config,
 ): McpToolContext | undefined {
   if (!(invocation instanceof DiscoveredMCPToolInvocation)) {
@@ -200,20 +62,22 @@ function extractMcpContext(
  * @param signal Abort signal for cancellation
  * @param liveOutputCallback Optional callback for live output updates
  * @param shellExecutionConfig Optional shell execution config
- * @param setPidCallback Optional callback to set the PID for shell invocations
+ * @param setExecutionIdCallback Optional callback to set an execution ID for backgroundable invocations
  * @param config Config to look up MCP server details for hook context
  * @returns The tool result
  */
 export async function executeToolWithHooks(
-  invocation: ShellToolInvocation | AnyToolInvocation,
+  invocation: AnyToolInvocation,
   toolName: string,
   signal: AbortSignal,
   tool: AnyDeclarativeTool,
-  liveOutputCallback?: (outputChunk: string | AnsiOutput) => void,
+  liveOutputCallback?: (outputChunk: ToolLiveOutput) => void,
   shellExecutionConfig?: ShellExecutionConfig,
-  setPidCallback?: (pid: number) => void,
+  setExecutionIdCallback?: (executionId: number) => void,
   config?: Config,
+  originalRequestName?: string,
 ): Promise<ToolResult> {
+  // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
   const toolInput = (invocation.params || {}) as Record<string, unknown>;
   let inputWasModified = false;
   let modifiedKeys: string[] = [];
@@ -227,6 +91,7 @@ export async function executeToolWithHooks(
       toolName,
       toolInput,
       mcpContext,
+      originalRequestName,
     );
 
     // Check if hook requested to stop entire agent execution
@@ -288,22 +153,14 @@ export async function executeToolWithHooks(
     }
   }
 
-  // Execute the actual tool
-  let toolResult: ToolResult;
-  if (setPidCallback && invocation instanceof ShellToolInvocation) {
-    toolResult = await invocation.execute(
-      signal,
-      liveOutputCallback,
-      shellExecutionConfig,
-      setPidCallback,
-    );
-  } else {
-    toolResult = await invocation.execute(
-      signal,
-      liveOutputCallback,
-      shellExecutionConfig,
-    );
-  }
+  // Execute the actual tool. Tools that support backgrounding can optionally
+  // surface an execution ID via the callback.
+  const toolResult: ToolResult = await invocation.execute(
+    signal,
+    liveOutputCallback,
+    shellExecutionConfig,
+    setExecutionIdCallback,
+  );
 
   // Append notification if parameters were modified
   if (inputWasModified) {
@@ -333,6 +190,7 @@ export async function executeToolWithHooks(
         error: toolResult.error,
       },
       mcpContext,
+      originalRequestName,
     );
 
     // Check if hook requested to stop entire agent execution
@@ -378,6 +236,12 @@ export async function executeToolWithHooks(
       } else {
         toolResult.llmContent = wrappedContext;
       }
+    }
+
+    // Check if the hook requested a tail tool call
+    const tailToolCallRequest = afterOutput?.getTailToolCallRequest();
+    if (tailToolCallRequest) {
+      toolResult.tailToolCallRequest = tailToolCallRequest;
     }
   }
 

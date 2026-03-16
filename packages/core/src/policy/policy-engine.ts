@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2025 Google LLC
+ * Copyright 2026 Google LLC
  * SPDX-License-Identifier: Apache-2.0
  */
 
@@ -11,22 +11,62 @@ import {
   type PolicyRule,
   type SafetyCheckerRule,
   type HookCheckerRule,
-  type HookExecutionContext,
-  getHookSource,
   ApprovalMode,
   type CheckResult,
+  ALWAYS_ALLOW_PRIORITY_FRACTION,
 } from './types.js';
 import { stableStringify } from './stable-stringify.js';
 import { debugLogger } from '../utils/debugLogger.js';
 import type { CheckerRunner } from '../safety/checker-runner.js';
 import { SafetyCheckDecision } from '../safety/protocol.js';
-import type { HookExecutionRequest } from '../confirmation-bus/types.js';
 import {
   SHELL_TOOL_NAMES,
   initializeShellParsers,
   splitCommands,
   hasRedirection,
 } from '../utils/shell-utils.js';
+import { getToolAliases } from '../tools/tool-names.js';
+import {
+  MCP_TOOL_PREFIX,
+  isMcpToolAnnotation,
+  parseMcpToolName,
+} from '../tools/mcp-tool.js';
+
+function isWildcardPattern(name: string): boolean {
+  return name === '*' || name.includes('*');
+}
+
+/**
+ * Checks if a tool call matches a wildcard pattern.
+ * Supports global (*) and the explicit MCP (*mcp_serverName_**) format.
+ */
+function matchesWildcard(
+  pattern: string,
+  toolName: string,
+  serverName: string | undefined,
+): boolean {
+  if (pattern === '*') {
+    return true;
+  }
+
+  if (pattern === `${MCP_TOOL_PREFIX}*`) {
+    return serverName !== undefined;
+  }
+
+  if (pattern.startsWith(MCP_TOOL_PREFIX) && pattern.endsWith('_*')) {
+    const expectedServerName = pattern.slice(MCP_TOOL_PREFIX.length, -2);
+    // 1. Must be an MCP tool call (has serverName)
+    // 2. Server name must match
+    // 3. Tool name must be properly qualified by that server
+    if (serverName === undefined || serverName !== expectedServerName) {
+      return false;
+    }
+    return toolName.startsWith(`${MCP_TOOL_PREFIX}${expectedServerName}_`);
+  }
+
+  // Not a recognized wildcard pattern, fallback to exact match just in case
+  return toolName === pattern;
+}
 
 function ruleMatches(
   rule: PolicyRule | SafetyCheckerRule,
@@ -34,6 +74,8 @@ function ruleMatches(
   stringifiedArgs: string | undefined,
   serverName: string | undefined,
   currentApprovalMode: ApprovalMode,
+  toolAnnotations?: Record<string, unknown>,
+  subagent?: string,
 ): boolean {
   // Check if rule applies to current approval mode
   if (rule.modes && rule.modes.length > 0) {
@@ -42,24 +84,50 @@ function ruleMatches(
     }
   }
 
+  // Check subagent if specified (only for PolicyRule, SafetyCheckerRule doesn't have it)
+  if ('subagent' in rule && rule.subagent) {
+    if (rule.subagent !== subagent) {
+      return false;
+    }
+  }
+
+  // Strictly enforce mcpName identity if the rule dictates it
+  if (rule.mcpName) {
+    if (rule.mcpName === '*') {
+      // Rule requires it to be ANY MCP tool
+      if (serverName === undefined) return false;
+    } else {
+      // Rule requires it to be a specific MCP server
+      if (serverName !== rule.mcpName) return false;
+    }
+  }
+
   // Check tool name if specified
   if (rule.toolName) {
-    // Support wildcard patterns: "serverName__*" matches "serverName__anyTool"
-    if (rule.toolName.endsWith('__*')) {
-      const prefix = rule.toolName.slice(0, -3); // Remove "__*"
-      if (serverName !== undefined) {
-        // Robust check: if serverName is provided, it MUST match the prefix exactly.
-        // This prevents "malicious-server" from spoofing "trusted-server" by naming itself "trusted-server__malicious".
-        if (serverName !== prefix) {
-          return false;
-        }
-      }
-      // Always verify the prefix, even if serverName matched
-      if (!toolCall.name || !toolCall.name.startsWith(prefix + '__')) {
+    // Support wildcard patterns: "mcp_serverName_*" matches "mcp_serverName_anyTool"
+    if (rule.toolName === '*') {
+      // Match all tools
+    } else if (isWildcardPattern(rule.toolName)) {
+      if (
+        !toolCall.name ||
+        !matchesWildcard(rule.toolName, toolCall.name, serverName)
+      ) {
         return false;
       }
     } else if (toolCall.name !== rule.toolName) {
       return false;
+    }
+  }
+
+  // Check annotations if specified
+  if (rule.toolAnnotations) {
+    if (!toolAnnotations) {
+      return false;
+    }
+    for (const [key, value] of Object.entries(rule.toolAnnotations)) {
+      if (toolAnnotations[key] !== value) {
+        return false;
+      }
     }
   }
 
@@ -81,34 +149,14 @@ function ruleMatches(
   return true;
 }
 
-/**
- * Check if a hook checker rule matches a hook execution context.
- */
-function hookCheckerMatches(
-  rule: HookCheckerRule,
-  context: HookExecutionContext,
-): boolean {
-  // Check event name if specified
-  if (rule.eventName && rule.eventName !== context.eventName) {
-    return false;
-  }
-
-  // Check hook source if specified
-  if (rule.hookSource && rule.hookSource !== context.hookSource) {
-    return false;
-  }
-
-  return true;
-}
-
 export class PolicyEngine {
   private rules: PolicyRule[];
   private checkers: SafetyCheckerRule[];
   private hookCheckers: HookCheckerRule[];
   private readonly defaultDecision: PolicyDecision;
   private readonly nonInteractive: boolean;
+  private readonly disableAlwaysAllow: boolean;
   private readonly checkerRunner?: CheckerRunner;
-  private readonly allowHooks: boolean;
   private approvalMode: ApprovalMode;
 
   constructor(config: PolicyEngineConfig = {}, checkerRunner?: CheckerRunner) {
@@ -123,8 +171,8 @@ export class PolicyEngine {
     );
     this.defaultDecision = config.defaultDecision ?? PolicyDecision.ASK_USER;
     this.nonInteractive = config.nonInteractive ?? false;
+    this.disableAlwaysAllow = config.disableAlwaysAllow ?? false;
     this.checkerRunner = checkerRunner;
-    this.allowHooks = config.allowHooks ?? true;
     this.approvalMode = config.approvalMode ?? ApprovalMode.DEFAULT;
   }
 
@@ -140,6 +188,13 @@ export class PolicyEngine {
    */
   getApprovalMode(): ApprovalMode {
     return this.approvalMode;
+  }
+
+  private isAlwaysAllowRule(rule: PolicyRule): boolean {
+    return (
+      rule.priority !== undefined &&
+      Math.round((rule.priority % 1) * 1000) === ALWAYS_ALLOW_PRIORITY_FRACTION
+    );
   }
 
   private shouldDowngradeForRedirection(
@@ -165,6 +220,8 @@ export class PolicyEngine {
     dir_path: string | undefined,
     allowRedirection?: boolean,
     rule?: PolicyRule,
+    toolAnnotations?: Record<string, unknown>,
+    subagent?: string,
   ): Promise<CheckResult> {
     if (!command) {
       return {
@@ -177,14 +234,28 @@ export class PolicyEngine {
     const subCommands = splitCommands(command);
 
     if (subCommands.length === 0) {
+      // If the matched rule says DENY, we should respect it immediately even if parsing fails.
+      if (ruleDecision === PolicyDecision.DENY) {
+        return { decision: PolicyDecision.DENY, rule };
+      }
+
+      // In YOLO mode, we should proceed anyway even if we can't parse the command.
+      if (this.approvalMode === ApprovalMode.YOLO) {
+        return {
+          decision: PolicyDecision.ALLOW,
+          rule,
+        };
+      }
+
       debugLogger.debug(
         `[PolicyEngine.check] Command parsing failed for: ${command}. Falling back to ASK_USER.`,
       );
+
       // Parsing logic failed, we can't trust it. Force ASK_USER (or DENY).
-      // We don't blame a specific rule here, unless the input rule was stricter.
+      // We return the rule that matched so the evaluation loop terminates.
       return {
         decision: this.applyNonInteractiveMode(PolicyDecision.ASK_USER),
-        rule: undefined,
+        rule,
       };
     }
 
@@ -241,6 +312,8 @@ export class PolicyEngine {
         const subResult = await this.check(
           { name: toolName, args: { command: subCmd, dir_path } },
           serverName,
+          toolAnnotations,
+          subagent,
         );
 
         // subResult.decision is already filtered through applyNonInteractiveMode by this.check()
@@ -298,7 +371,25 @@ export class PolicyEngine {
   async check(
     toolCall: FunctionCall,
     serverName: string | undefined,
+    toolAnnotations?: Record<string, unknown>,
+    subagent?: string,
   ): Promise<CheckResult> {
+    // Case 1: Metadata injection is the primary and safest way to identify an MCP server.
+    // If we have explicit `_serverName` metadata (usually injected by tool-registry for active tools), use it.
+    if (!serverName && isMcpToolAnnotation(toolAnnotations)) {
+      serverName = toolAnnotations._serverName;
+    }
+
+    // Case 2: Fallback for static FQN strings (e.g. from TOML policies or allowed/excluded settings strings).
+    // These strings don't have active metadata objects associated with them during policy generation,
+    // so we must extract the server name from the qualified `mcp_{server}_{tool}` format.
+    if (!serverName && toolCall.name) {
+      const parsed = parseMcpToolName(toolCall.name);
+      if (parsed.serverName) {
+        serverName = parsed.serverName;
+      }
+    }
+
     let stringifiedArgs: string | undefined;
     // Compute stringified args once before the loop
     if (
@@ -322,6 +413,7 @@ export class PolicyEngine {
 
     if (toolName && SHELL_TOOL_NAMES.includes(toolName)) {
       isShellCommand = true;
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
       const args = toolCall.args as { command?: string; dir_path?: string };
       command = args?.command;
       shellDirPath = args?.dir_path;
@@ -331,19 +423,29 @@ export class PolicyEngine {
     let matchedRule: PolicyRule | undefined;
     let decision: PolicyDecision | undefined;
 
-    // For tools with a server name, we want to try matching both the
-    // original name and the fully qualified name (server__tool).
-    const toolCallsToTry: FunctionCall[] = [toolCall];
-    if (serverName && toolCall.name && !toolCall.name.includes('__')) {
-      toolCallsToTry.push({
-        ...toolCall,
-        name: `${serverName}__${toolCall.name}`,
-      });
+    // We also want to check legacy aliases for the tool name.
+    const toolNamesToTry = toolCall.name ? getToolAliases(toolCall.name) : [];
+
+    const toolCallsToTry: FunctionCall[] = [];
+    for (const name of toolNamesToTry) {
+      toolCallsToTry.push({ ...toolCall, name });
     }
 
     for (const rule of this.rules) {
+      if (this.disableAlwaysAllow && this.isAlwaysAllowRule(rule)) {
+        continue;
+      }
+
       const match = toolCallsToTry.some((tc) =>
-        ruleMatches(rule, tc, stringifiedArgs, serverName, this.approvalMode),
+        ruleMatches(
+          rule,
+          tc,
+          stringifiedArgs,
+          serverName,
+          this.approvalMode,
+          toolAnnotations,
+          subagent,
+        ),
       );
 
       if (match) {
@@ -360,6 +462,8 @@ export class PolicyEngine {
             shellDirPath,
             rule.allowRedirection,
             rule,
+            toolAnnotations,
+            subagent,
           );
           decision = shellResult.decision;
           if (shellResult.rule) {
@@ -376,6 +480,15 @@ export class PolicyEngine {
 
     // Default if no rule matched
     if (decision === undefined) {
+      if (this.approvalMode === ApprovalMode.YOLO) {
+        debugLogger.debug(
+          `[PolicyEngine.check] NO MATCH in YOLO mode - using ALLOW`,
+        );
+        return {
+          decision: PolicyDecision.ALLOW,
+        };
+      }
+
       debugLogger.debug(
         `[PolicyEngine.check] NO MATCH - using default decision: ${this.defaultDecision}`,
       );
@@ -386,6 +499,10 @@ export class PolicyEngine {
           this.defaultDecision,
           serverName,
           shellDirPath,
+          false,
+          undefined,
+          toolAnnotations,
+          subagent,
         );
         decision = shellResult.decision;
         matchedRule = shellResult.rule;
@@ -404,6 +521,8 @@ export class PolicyEngine {
             stringifiedArgs,
             serverName,
             this.approvalMode,
+            toolAnnotations,
+            subagent,
           )
         ) {
           debugLogger.debug(
@@ -463,10 +582,49 @@ export class PolicyEngine {
   }
 
   /**
-   * Remove rules for a specific tool.
+   * Remove rules matching a specific tier (priority band).
    */
-  removeRulesForTool(toolName: string): void {
-    this.rules = this.rules.filter((rule) => rule.toolName !== toolName);
+  removeRulesByTier(tier: number): void {
+    this.rules = this.rules.filter(
+      (rule) => Math.floor(rule.priority ?? 0) !== tier,
+    );
+  }
+
+  /**
+   * Remove rules matching a specific source.
+   */
+  removeRulesBySource(source: string): void {
+    this.rules = this.rules.filter((rule) => rule.source !== source);
+  }
+
+  /**
+   * Remove checkers matching a specific tier (priority band).
+   */
+  removeCheckersByTier(tier: number): void {
+    this.checkers = this.checkers.filter(
+      (checker) => Math.floor(checker.priority ?? 0) !== tier,
+    );
+  }
+
+  /**
+   * Remove checkers matching a specific source.
+   */
+  removeCheckersBySource(source: string): void {
+    this.checkers = this.checkers.filter(
+      (checker) => checker.source !== source,
+    );
+  }
+
+  /**
+   * Remove rules for a specific tool.
+   * If source is provided, only rules matching that source are removed.
+   */
+  removeRulesForTool(toolName: string, source?: string): void {
+    this.rules = this.rules.filter(
+      (rule) =>
+        rule.toolName !== toolName ||
+        (source !== undefined && rule.source !== source),
+    );
   }
 
   /**
@@ -474,6 +632,18 @@ export class PolicyEngine {
    */
   getRules(): readonly PolicyRule[] {
     return this.rules;
+  }
+
+  /**
+   * Check if a rule for a specific tool already exists.
+   * If ignoreDynamic is true, it only returns true if a rule exists that was NOT added by AgentRegistry.
+   */
+  hasRuleForTool(toolName: string, ignoreDynamic = false): boolean {
+    return this.rules.some(
+      (rule) =>
+        rule.toolName === toolName &&
+        (!ignoreDynamic || rule.source !== 'AgentRegistry (Dynamic)'),
+    );
   }
 
   getCheckers(): readonly SafetyCheckerRule[] {
@@ -496,81 +666,92 @@ export class PolicyEngine {
   }
 
   /**
-   * Check if a hook execution is allowed based on the configured policies.
-   * Runs hook-specific safety checkers if configured.
+   * Get tools that are effectively denied by the current rules.
+   * This takes into account:
+   * 1. Global rules (no argsPattern)
+   * 2. Priority order (higher priority wins)
+   * 3. Non-interactive mode (ASK_USER becomes DENY)
+   * 4. Annotation-based rules (when toolMetadata is provided)
+   *
+   * @param toolMetadata Optional map of tool names to their annotations.
+   *   When provided, annotation-based rules can match tools by their metadata.
+   *   When not provided, rules with toolAnnotations are skipped (conservative fallback).
    */
-  async checkHook(
-    request: HookExecutionRequest | HookExecutionContext,
-  ): Promise<PolicyDecision> {
-    // If hooks are globally disabled, deny all hook executions
-    if (!this.allowHooks) {
-      return PolicyDecision.DENY;
+  getExcludedTools(
+    toolMetadata?: Map<string, Record<string, unknown>>,
+    allToolNames?: Set<string>,
+  ): Set<string> {
+    const excludedTools = new Set<string>();
+
+    if (!allToolNames) {
+      return excludedTools;
     }
 
-    const context: HookExecutionContext =
-      'input' in request
-        ? {
-            eventName: request.eventName,
-            hookSource: getHookSource(request.input),
-            trustedFolder:
-              typeof request.input['trusted_folder'] === 'boolean'
-                ? request.input['trusted_folder']
-                : undefined,
-          }
-        : request;
+    for (const toolName of allToolNames) {
+      const annotations = toolMetadata?.get(toolName);
+      const serverName = isMcpToolAnnotation(annotations)
+        ? annotations._serverName
+        : undefined;
 
-    // In untrusted folders, deny project-level hooks
-    if (context.trustedFolder === false && context.hookSource === 'project') {
-      return PolicyDecision.DENY;
-    }
+      let staticallyExcluded = false;
+      let matchFound = false;
 
-    // Run hook-specific safety checkers if configured
-    if (this.checkerRunner && this.hookCheckers.length > 0) {
-      for (const checkerRule of this.hookCheckers) {
-        if (hookCheckerMatches(checkerRule, context)) {
-          debugLogger.debug(
-            `[PolicyEngine.checkHook] Running hook checker: ${checkerRule.checker.name} for event: ${context.eventName}`,
-          );
-          try {
-            // Create a synthetic function call for the checker runner
-            // This allows reusing the existing checker infrastructure
-            const syntheticCall = {
-              name: `hook:${context.eventName}`,
-              args: {
-                hookSource: context.hookSource,
-                trustedFolder: context.trustedFolder,
-              },
-            };
+      // Evaluate rules in priority order (they are already sorted in constructor)
+      for (const rule of this.rules) {
+        if (this.disableAlwaysAllow && this.isAlwaysAllowRule(rule)) {
+          continue;
+        }
 
-            const result = await this.checkerRunner.runChecker(
-              syntheticCall,
-              checkerRule.checker,
-            );
+        // Create a copy of the rule without argsPattern to see if it targets the tool
+        // regardless of the runtime arguments it might receive.
+        const ruleWithoutArgs: PolicyRule = { ...rule, argsPattern: undefined };
+        const toolCall: FunctionCall = { name: toolName, args: {} };
 
-            if (result.decision === SafetyCheckDecision.DENY) {
-              debugLogger.debug(
-                `[PolicyEngine.checkHook] Hook checker denied: ${result.reason}`,
-              );
-              return PolicyDecision.DENY;
-            } else if (result.decision === SafetyCheckDecision.ASK_USER) {
-              debugLogger.debug(
-                `[PolicyEngine.checkHook] Hook checker requested ASK_USER: ${result.reason}`,
-              );
-              // For hooks, ASK_USER is treated as DENY in non-interactive mode
-              return this.applyNonInteractiveMode(PolicyDecision.ASK_USER);
+        const appliesToTool = ruleMatches(
+          ruleWithoutArgs,
+          toolCall,
+          undefined, // stringifiedArgs
+          serverName,
+          this.approvalMode,
+          annotations,
+        );
+
+        if (appliesToTool) {
+          if (rule.argsPattern) {
+            // Exclusions only apply statically before arguments are known.
+            if (rule.decision !== PolicyDecision.DENY) {
+              // Conditionally allowed/asked based on args. Therefore NOT statically excluded.
+              staticallyExcluded = false;
+              matchFound = true;
+              break;
             }
-          } catch (error) {
-            debugLogger.debug(
-              `[PolicyEngine.checkHook] Hook checker failed: ${error}`,
-            );
-            return PolicyDecision.DENY;
+            // If it's conditionally DENIED based on args, it means it's not unconditionally denied.
+            // We must keep evaluating lower priority rules to see the default/unconditional state.
+            continue;
+          } else {
+            // Unconditional rule for this tool
+            const decision = this.applyNonInteractiveMode(rule.decision);
+            staticallyExcluded = decision === PolicyDecision.DENY;
+            matchFound = true;
+            break;
           }
         }
       }
+
+      if (!matchFound) {
+        // Fallback to default decision if no rule matches
+        const defaultDec = this.applyNonInteractiveMode(this.defaultDecision);
+        if (defaultDec === PolicyDecision.DENY) {
+          staticallyExcluded = true;
+        }
+      }
+
+      if (staticallyExcluded) {
+        excludedTools.add(toolName);
+      }
     }
 
-    // Default: Allow hooks
-    return PolicyDecision.ALLOW;
+    return excludedTools;
   }
 
   private applyNonInteractiveMode(decision: PolicyDecision): PolicyDecision {

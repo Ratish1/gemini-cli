@@ -5,26 +5,26 @@
  */
 
 import type { Config } from '../config/config.js';
-import { HookRegistry } from './hookRegistry.js';
+import { HookRegistry, type HookRegistryEntry } from './hookRegistry.js';
 import { HookRunner } from './hookRunner.js';
-import { HookAggregator } from './hookAggregator.js';
+import { HookAggregator, type AggregatedHookResult } from './hookAggregator.js';
 import { HookPlanner } from './hookPlanner.js';
 import { HookEventHandler } from './hookEventHandler.js';
-import type { HookRegistryEntry } from './hookRegistry.js';
-import { logs, type Logger } from '@opentelemetry/api-logs';
-import { SERVICE_NAME } from '../telemetry/constants.js';
 import { debugLogger } from '../utils/debugLogger.js';
-import type {
-  SessionStartSource,
-  SessionEndReason,
-  PreCompressTrigger,
-  DefaultHookOutput,
-  BeforeModelHookOutput,
-  AfterModelHookOutput,
-  BeforeToolSelectionHookOutput,
-  McpToolContext,
+import {
+  NotificationType,
+  type SessionStartSource,
+  type SessionEndReason,
+  type PreCompressTrigger,
+  type DefaultHookOutput,
+  type BeforeModelHookOutput,
+  type AfterModelHookOutput,
+  type BeforeToolSelectionHookOutput,
+  type McpToolContext,
+  type HookConfig,
+  type HookEventName,
+  type ConfigSource,
 } from './types.js';
-import type { AggregatedHookResult } from './hookAggregator.js';
 import type {
   GenerateContentParameters,
   GenerateContentResponse,
@@ -33,6 +33,7 @@ import type {
   ToolConfig,
   ToolListUnion,
 } from '@google/genai';
+import type { ToolCallConfirmationDetails } from '../tools/tools.js';
 
 /**
  * Main hook system that coordinates all hook-related functionality
@@ -78,6 +79,73 @@ export interface AfterModelHookResult {
   reason?: string;
 }
 
+/**
+ * Converts ToolCallConfirmationDetails to a serializable format for hooks.
+ * Excludes function properties (onConfirm, ideConfirmation) that can't be serialized.
+ */
+function toSerializableDetails(
+  details: ToolCallConfirmationDetails,
+): Record<string, unknown> {
+  const base: Record<string, unknown> = {
+    type: details.type,
+    title: details.title,
+  };
+
+  switch (details.type) {
+    case 'edit':
+      return {
+        ...base,
+        fileName: details.fileName,
+        filePath: details.filePath,
+        fileDiff: details.fileDiff,
+        originalContent: details.originalContent,
+        newContent: details.newContent,
+        isModifying: details.isModifying,
+      };
+    case 'exec':
+      return {
+        ...base,
+        command: details.command,
+        rootCommand: details.rootCommand,
+      };
+    case 'mcp':
+      return {
+        ...base,
+        serverName: details.serverName,
+        toolName: details.toolName,
+        toolDisplayName: details.toolDisplayName,
+      };
+    case 'info':
+      return {
+        ...base,
+        prompt: details.prompt,
+        urls: details.urls,
+      };
+    default:
+      return base;
+  }
+}
+
+/**
+ * Gets the message to display in the notification hook for tool confirmation.
+ */
+function getNotificationMessage(
+  confirmationDetails: ToolCallConfirmationDetails,
+): string {
+  switch (confirmationDetails.type) {
+    case 'edit':
+      return `Tool ${confirmationDetails.title} requires editing`;
+    case 'exec':
+      return `Tool ${confirmationDetails.title} requires execution`;
+    case 'mcp':
+      return `Tool ${confirmationDetails.title} requires MCP`;
+    case 'info':
+      return `Tool ${confirmationDetails.title} requires information`;
+    default:
+      return `Tool requires confirmation`;
+  }
+}
+
 export class HookSystem {
   private readonly hookRegistry: HookRegistry;
   private readonly hookRunner: HookRunner;
@@ -86,9 +154,6 @@ export class HookSystem {
   private readonly hookEventHandler: HookEventHandler;
 
   constructor(config: Config) {
-    const logger: Logger = logs.getLogger(SERVICE_NAME);
-    const messageBus = config.getMessageBus();
-
     // Initialize components
     this.hookRegistry = new HookRegistry(config);
     this.hookRunner = new HookRunner(config);
@@ -96,11 +161,9 @@ export class HookSystem {
     this.hookPlanner = new HookPlanner(this.hookRegistry);
     this.hookEventHandler = new HookEventHandler(
       config,
-      logger,
       this.hookPlanner,
       this.hookRunner,
       this.hookAggregator,
-      messageBus, // Pass MessageBus to enable mediated hook execution
     );
   }
 
@@ -138,6 +201,17 @@ export class HookSystem {
    */
   getAllHooks(): HookRegistryEntry[] {
     return this.hookRegistry.getAllHooks();
+  }
+
+  /**
+   * Register a new hook programmatically
+   */
+  registerHook(
+    config: HookConfig,
+    eventName: HookEventName,
+    options?: { matcher?: string; sequential?: boolean; source?: ConfigSource },
+  ): void {
+    this.hookRegistry.registerHook(config, eventName, options);
   }
 
   /**
@@ -200,6 +274,7 @@ export class HookSystem {
 
       const blockingError = hookOutput?.getBlockingError();
       if (blockingError?.blocked) {
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
         const beforeModelOutput = hookOutput as BeforeModelHookOutput;
         const syntheticResponse = beforeModelOutput.getSyntheticResponse();
         return {
@@ -211,6 +286,7 @@ export class HookSystem {
       }
 
       if (hookOutput) {
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
         const beforeModelOutput = hookOutput as BeforeModelHookOutput;
         const modifiedRequest =
           beforeModelOutput.applyLLMRequestModifications(llmRequest);
@@ -257,6 +333,7 @@ export class HookSystem {
       }
 
       if (hookOutput) {
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
         const afterModelOutput = hookOutput as AfterModelHookOutput;
         const modifiedResponse = afterModelOutput.getModifiedResponse();
         if (modifiedResponse) {
@@ -303,16 +380,18 @@ export class HookSystem {
     toolName: string,
     toolInput: Record<string, unknown>,
     mcpContext?: McpToolContext,
+    originalRequestName?: string,
   ): Promise<DefaultHookOutput | undefined> {
     try {
       const result = await this.hookEventHandler.fireBeforeToolEvent(
         toolName,
         toolInput,
         mcpContext,
+        originalRequestName,
       );
       return result.finalOutput;
     } catch (error) {
-      debugLogger.debug(`BeforeTool hook failed for ${toolName}:`, error);
+      debugLogger.debug(`BeforeToolEvent failed for ${toolName}:`, error);
       return undefined;
     }
   }
@@ -326,6 +405,7 @@ export class HookSystem {
       error: unknown;
     },
     mcpContext?: McpToolContext,
+    originalRequestName?: string,
   ): Promise<DefaultHookOutput | undefined> {
     try {
       const result = await this.hookEventHandler.fireAfterToolEvent(
@@ -333,11 +413,32 @@ export class HookSystem {
         toolInput,
         toolResponse as Record<string, unknown>,
         mcpContext,
+        originalRequestName,
       );
       return result.finalOutput;
     } catch (error) {
-      debugLogger.debug(`AfterTool hook failed for ${toolName}:`, error);
+      debugLogger.debug(`AfterToolEvent failed for ${toolName}:`, error);
       return undefined;
+    }
+  }
+
+  async fireToolNotificationEvent(
+    confirmationDetails: ToolCallConfirmationDetails,
+  ): Promise<void> {
+    try {
+      const message = getNotificationMessage(confirmationDetails);
+      const serializedDetails = toSerializableDetails(confirmationDetails);
+
+      await this.hookEventHandler.fireNotificationEvent(
+        NotificationType.ToolPermission,
+        message,
+        serializedDetails,
+      );
+    } catch (error) {
+      debugLogger.debug(
+        `NotificationEvent failed for ${confirmationDetails.title}:`,
+        error,
+      );
     }
   }
 }
